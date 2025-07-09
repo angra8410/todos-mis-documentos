@@ -1,0 +1,412 @@
+USE [Data_Services]
+GO
+/****** Object:  StoredProcedure [dbo].[usp_ShcDsVendor_PressGaneyOpd]    Script Date: 7/9/2025 8:55:13 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+
+/*=============================================
+   Author:		Jeanne Guzek
+   Create date: 10/25/2022
+   Description:	Vendor Extract - Press Ganey OPD files used for Patient Experience surveying and PG’s consumerism team for Marketing purposes.
+
+   Notes:
+     >Extracted based on visit location.   Locations are stored in table Data_Services.dbo.PressGaneyOpdLoc
+     >Registration types CLI, RCR and SDC discharges
+	    >>RCR discharges exclude visits which are Auto DC at end of month for administrative reasons even though therapy
+		  not completed.  Visits Auto DC'd will not have a user in the Discharge user field.
+	    >>SDC visits have a 4 day discharge lag so can exclude visits which have been included in the AMB file based on CPT code.  To ensure
+		     visit has been coded ABS status must be Final, In Process, or Hold
+       >>>SDC visits will also be extracted in a Catchup file looking back 4 weeks for visits which may not have been coded w/n 4 days of discharge.
+
+   To manually run - Highlight Line Below and Execute (F5)
+		Execute Data_Services.dbo.usp_ShcDsVendor_PressGaneyOpd 'FPGM,FCGM','NA','2025-07-02','2025-07-02','ADHOC'
+		EXEC dbo.usp_ShcDsVendor_PressGaneyOpd @dFacility='FPGM,FCGM', @Site='NA', @dFromDate='2025-07-02', @dThruDate='2025-07-02', @RunType='ADHOC'
+
+   =============================================
+   Change History
+   =============================================
+	PROD Date	Author	Dev Date	Description
+	---------	-------	---------	------------
+	11/3/22		JMG03	10/25/22	Implemented 
+	 1/9/23		JMG03    1/9/23		implement the coding for MKT_COMM (Col Y)
+	 5/9/23	    JMG03	3/28/23		Modify according to tkt 2690458 - add Race, Ethnicity (Detail), Sexual Orientation and Preferred Language Name
+     5/9/23		JMG03	4/10/23		Update to exclude admit source of PRISON or LAW (UB82 = 8) per ticket 2690458.  Done in output selects, not qualifying accts	
+				                      and Age restriction Removed.  Updated xEXP field (Col U) with new label: DeceasedFlag, removed expired exclusion code as expired flag exists.
+	 5/9/23     JMG03	5/9/23		Added a multi-facility select to allow running a single file with all facilities rather the individual files per facility.
+	 5/10/23    JMG03   5/10/23     Fixed issue with SDC Catchup run not producing date.   Where criteria had <> to SDC.CU when it should have had = SDC.CU
+	 7/28/23	JMG03   7/28/23		Tkt 2826745 - add additional language mapping
+
+*/
+--To run outside of stored procedure uncomment the below, and comment out ALTER PROC thru BEGIN.  Also Comment out END statment.
+--===================================================
+--Declare	
+--			@dFacility		VARCHAR (MAX),
+--			@Site			VARCHAR (15),
+--			@dFromDate		DATE,
+--			@dThruDate		DATE,
+--			@RunType		VARCHAR (15)
+
+--SET @dFromDate = '2023-02-20'
+--SET @dThruDate = '2023-03-10'
+--SET @dFacility = 'FLO,CGM,PGM'
+--SET @Site = 'NA'
+--SET @RunType = 'SDC.CU'
+--====================================================
+ALTER PROCEDURE [dbo].[usp_ShcDsVendor_PressGaneyOpd]
+    @dFacility    VARCHAR (MAX) = 'FPGM,FCGM',
+    @Site         VARCHAR (15) = 'NA',
+    @dFromDate    DATE = '2025-07-03',
+    @dThruDate    DATE = '2025-07-03',
+    @RunType      VARCHAR (15) = 'ADHOC'
+AS
+BEGIN
+
+
+
+    SET NOCOUNT ON;
+
+    DECLARE @local_fromDate  DateTime,
+            @local_thruDate  DateTime,
+            @local_facility  VARCHAR(MAX);
+
+    SET @local_fromDate = CASE
+        WHEN @RunType = 'ADHOC' THEN @dFromDate
+        WHEN @RunType = 'DAILY' THEN DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), -1)
+    END;
+
+    SET @local_thruDate = CASE
+        WHEN @RunType = 'ADHOC' THEN DATEADD(MS, -3, DATEADD(DD, 1, DATEADD(DD, 0, DATEDIFF(DD, 0, @dThruDate))))
+        WHEN @RunType = 'DAILY' THEN DATEADD(DAY, DATEDIFF(DAY, 0, GETDATE()), -1)
+    END;
+
+    SET @local_facility = @dFacility;
+
+    --Get Qualifying accounts
+    WITH Accounts AS (
+        SELECT DISTINCT 
+            REG.SourceID,
+            REG.VisitID,
+            REG.PatientID,
+            REG.Facility_MisFacID,
+            -- Calculate facility for facility ID when multi-campus not sharing facility ID.
+            CASE
+                WHEN REG.Facility_MisFacID = 'SET' and LEFT(REG.Location_MisLocID,5) = 'SETVB' THEN 'SEV'
+                WHEN REG.Facility_MisFacID = 'SET' and LEFT(REG.Location_MisLocID,5) <> 'SETVB' THEN 'SET'
+                WHEN REG.Facility_MisFacID = 'HFS' and LEFT(MLM.Name,2) = 'HM' THEN 'HFS-H'
+                WHEN REG.Facility_MisFacID = 'DHM' and Left(REG.Location_MisLocID,4) = 'DHMW' THEN 'DHM-W'
+                ELSE REG.Facility_MisFacID
+            END AS [Facility_Calc],
+            REG.AccountNumber,
+            REG.Location_MisLocID AS [LocID],
+            REG.RegistrationType_MisRegTypeID AS [RegType],
+            REG.Confidential AS [RegConfidential],
+            REGR.AdmitSource_MisAdmSrcID AS AdmSrc,
+            RART.RegistrationTypeDischargeDisposition_MisDischDisposID AS [DcDispo],
+            HIM.NameFirst,
+            HIM.NameMiddle,
+            HIM.NameLast,
+            HIM.Sex,
+            HIM.Birthdate,
+            ISNULL(HIM.Expired,'N') AS [Expired],
+            HIM.Confidential AS [HimConfidential],
+            (SELECT MRN FROM Data_Services.dbo.udf_GetMRN(REG.SourceID,REG.Facility_MisFacID,REG.PatientID)) AS MRN,
+            CONVERT(VARCHAR(10), (RART.RegistrationTypeDischargeDateTime), 101) AS [DischDt],
+            CONVERT(VARCHAR(10), (REG.ServiceDateTime), 101) AS [ServiceDt],
+            SDC.CPT AS [CPT_SDC],
+            am.AbstractStatusField
+        FROM livefdb.dbo.RegAcct_Main as REG
+        JOIN livefdb.dbo.AbsAcct_Main am ON REG.SourceID = am.SourceID AND REG.VisitID = am.VisitID
+        INNER JOIN livefdb.dbo.RegAcct_RegistrationTypes RART ON REG.SourceID = RART.SourceID
+            AND REG.VisitID = RART.VisitID
+            AND REG.RegistrationType_MisRegTypeID = RART.RegistrationTypeKey_MisRegTypeID
+        LEFT JOIN livefdb.dbo.RegAcct_Registration REGR ON REGR.SourceID = REG.SourceID AND REGR.VisitID = REG.VisitID
+        INNER JOIN livefdb.dbo.HimRec_Main HIM ON HIM.SourceID = REG.SourceID AND HIM.PatientID = REG.PatientID
+        LEFT JOIN livefdb.dbo.MisLoc_Main MLM ON REG.Location_MisLocID = MLM.MisLocID AND REG.SourceID = MLM.SourceID
+        OUTER APPLY (
+            SELECT TOP 1 c.ApcHcpcsCptCode_MisCptID AS [CPT]
+            FROM livefdb.dbo.AbsAcct_ApcsHcpcsCpt c
+            WHERE REG.SourceID = c.SourceID
+                AND REG.VisitID = c.VisitID
+                AND REG.RegistrationType_MisRegTypeID = 'SDC'
+                AND (c.ApcHcpcsCptCode_MisCptID BETWEEN '10004' AND '69990'
+                     OR c.ApcHcpcsCptCode_MisCptID IN ('G0104','G0105','G0121','G0260'))
+        ) SDC
+WHERE
+ REG.Facility_MisFacID IN (
+      SELECT [Value] FROM dbo.udf_Split(@dFacility, ',')
+    )
+--WHERE REG.Facility_MisFacID  IN ('FCGM','FPGM')
+
+            AND REG.Location_MisLocID in (
+                'CAR.CGQ','DI.CTCGQ','SDC.ENDCGQ','GI.CGQ','LAB.CGQ','DI.MRICGQ','DI.NMCGQ','RHB.OTCGQ',
+                'RHB.PTCGQ','PAT.CGQ','DI.CGQ','RSP.CGQ','SDC.CGQ','SPEC.CGQ','RHB.STCGQ','DI.USCGQ',
+                'DI.XRCGQ','CAR.CLFMQ','CAR.RHBFMQ','CAR.FMQ','DI.CTFMQ','SDC.ENDFMQ','HYPER.FMQ','LAB.FMQ',
+                'DI.MAMFMQ','DI.MRIFMQ','DI.NMFMQ','RHB.OTFMQ','PAIN.FMQ','RHB.PTFMQ','PAT.FMQ','DI.FMQ',
+                'RSP.FMQ','SPEC.FMQ','RHB.STFMQ','SDC.FMQ','DI.USFMQ','WOUND.FMQ','DI.XRFMQ','BC.HHQ',
+                'CAR.HHQ','DI.CTHHQ','CAR.ELHHQ','CAR.EKGHHQ','SDC.ENDHHQ','GI.HHQ','HYPER.HHQ','LAB.HHQ',
+                'DI.MRIHHQ','DI.NMHHQ','RHB.OTHHQ','RHB.PTHHQ','PAT.HHQ','DI.HHQ','RSP.HHQ','SPEC.HHQ',
+                'RHB.STHHQ','SDC.HHQ','DI.USHHQ','WOUND.HHQ','DI.XRHHQ','SDC.AMBNSQ','BC.NSQ','CANCER.NSQ',
+                'CAR.CLNSQ','CAR.NSQ','DI.CTNSQ','CAR.ELNSQ','NEU.EEGNSQ','CAR.EKGNSQ','SDC.ENDONSQ','IR.NSQ',
+                'LAB.NSQ','DI.MRINSQ','DI.NMNSQ','RHB.OTNSQ','OP.NSQ','PM.NSQ','RHB.PT.NSQ','PAT.NSQ','DI.NSQ',
+                'RSP.NSQ','RHB.STNSQ','DI.USNSQ','VL.NSQ','WOUND.NSQ','DI.XRNSQ','SDC.AMBPMQ','CAR.CLPMQ',
+                'CAR.PMQ','DI.CTPMQ','NEU.EEGPMQ','CAR.EKGPMQ','SDC.ENDOPMQ','GI.PMQ','HYP.PMQ','LAB.PMQ',
+                'MAT.PMQ','DI.MRIPMQ','DI.NMPMQ','RHB.OTPMQ','RHB.PTPMQ','PAT.PMQ','DI.RADPMQ','RSP.PMQ',
+                'NEU.SLPMQ','SPEC.PMQ','RHB.STPMQ','DI.USPMQ','CLWOMPMQ','DI.XRPMQ'
+            )
+            AND (
+                ((REG.Facility_MisFacID NOT IN ('SET','HFS','DHM','CDHM') OR @Site = 'NA'))
+                OR (REG.Facility_MisFacID = 'SET' AND @Site = 'SET' AND LEFT(REG.Location_MisLocID,5) <> 'SETVB')
+                OR (REG.Facility_MisFacID = 'SET' AND @Site = 'SEV' AND LEFT(REG.Location_MisLocID,5) = 'SETVB')
+                OR (REG.Facility_MisFacID = 'HFS' AND @Site = 'HM' AND LEFT(MLM.Name,2) = 'HM' AND RART.RegistrationTypeDischargeDateTime !< '2021-08-01')
+                OR (REG.Facility_MisFacID = 'HFS' AND @Site = 'HF' AND LEFT(MLM.Name,2) = 'HM' AND RART.RegistrationTypeDischargeDateTime < '2021-08-01')
+                OR (REG.Facility_MisFacID = 'HFS' AND @Site = 'HF' AND LEFT(MLM.Name,2) = 'HF')
+                OR (REG.Facility_MisFacID IN ('DHM','CDHM') AND @Site = 'DHMW' AND REG.Location_MisLocID IN ('DHMWED','DHMWEDHO','DHCWED','DHMCEDHO') 
+                    AND RART.RegistrationTypeDischargeDateTime !< '2021-08-01')
+                OR (REG.Facility_MisFacID = 'DHM' AND @Site = 'DHM' AND REG.Location_MisLocID IN ('DHMWED','DHMWEDHO') 
+                    AND RART.RegistrationTypeDischargeDateTime < '2021-08-01')
+                OR (REG.Facility_MisFacID IN ('DHM','CDHM') AND @Site = 'DHM' AND REG.Location_MisLocID NOT IN ('DHMWED','DHMWEDH','DHCWED','DHMCEDHO'))
+            )
+            AND (
+                ((REG.RegistrationType_MisRegTypeID = 'CLI' AND @RunType <> 'SDC.CU'
+                  AND RART.RegistrationTypeDischargeDateTime BETWEEN @local_fromDate AND @local_thruDate)
+                )
+                OR
+                (REG.RegistrationType_MisRegTypeID = 'RCR' AND @RunType <> 'SDC.CU'
+                  AND RART.RegistrationTypeDischargeDateTime BETWEEN @local_fromDate AND @local_thruDate
+                  AND RART.RegistrationTypeDischargeUser_UnvUserID IS NOT NULL
+                )
+                OR
+                (REG.RegistrationType_MisRegTypeID = 'SDC' AND @RunType <> 'SDC.CU'
+                  AND RART.RegistrationTypeDischargeDateTime BETWEEN DATEADD(DAY,DATEDIFF(DAY,0,@local_fromDate),-4)
+                                                                 AND DATEADD(MS,-3,DATEADD(DD,1,DATEADD(DD,-4,DATEDIFF(DD,0,@local_thruDate))))
+                  AND SDC.CPT IS NULL
+                  AND am.AbstractStatusField IN ('Final','In Process','Hold')
+                )
+                OR
+                (REG.RegistrationType_MisRegTypeID = 'SDC' AND @RunType = 'SDC.CU'
+                  AND RART.RegistrationTypeDischargeDateTime BETWEEN DATEADD(DAY,DATEDIFF(DAY,-1,GETDATE()),-28)
+                                                                 AND DATEADD(MS,-3,DATEADD(DD,1,DATEADD(DD,-21,DATEDIFF(DD,1,GETDATE()))))
+                  AND SDC.CPT IS NULL
+                  AND am.AbstractStatusField IN ('Final','In Process','Hold')
+                )
+            )
+    )
+
+    SELECT DISTINCT 'OU0101' AS DESIGNATOR,
+           @local_fromDate AS [From Date],
+           @local_thruDate AS [Thru Date],
+           RegType,
+           CLIENTID = CASE
+                WHEN A.Facility_Calc = 'CAS' THEN '138'
+                WHEN A.Facility_Calc = 'GSS' THEN '1417'
+                WHEN A.Facility_Calc = 'HFS' THEN '1368'
+                WHEN A.Facility_Calc = 'HFS-H' AND A.DischDt < '2021-08-01' THEN '1368'
+                WHEN A.Facility_Calc = 'HFS-H' AND A.DischDt !< '2021-08-01' THEN '38258'
+                WHEN A.Facility_Calc = 'MHS' THEN '181'
+                WHEN A.Facility_Calc = 'NHS' THEN '46'
+                WHEN A.Facility_Calc = 'NVS' THEN '15754'
+                WHEN A.Facility_Calc = 'SAS' THEN '1554'
+                WHEN A.Facility_Calc = 'SES' THEN '808'
+                WHEN A.Facility_Calc IN ('FROH','ROH') THEN '2027'
+                WHEN A.Facility_Calc IN ('FMEH','MEH') THEN '3255'
+                WHEN A.Facility_Calc IN ('SRH') THEN '4150'
+                WHEN A.Facility_Calc IN ('FSRM','SRM') THEN '12681'
+                WHEN A.Facility_Calc IN ('NMC') THEN '17308'
+                WHEN A.Facility_Calc IN ('FTMH','TMH') THEN '17322'
+                WHEN A.Facility_Calc IN ('FHRH','HRH') THEN '29911'
+                WHEN A.Facility_Calc IN ('EAH') THEN '1638'
+                WHEN A.Facility_Calc IN ('ZFH') THEN '27817'
+                WHEN A.Facility_Calc IN ('FCGM','CGM') THEN '29222'
+                WHEN A.Facility_Calc IN ('FFLO','FLO') THEN '29235'
+                WHEN A.Facility_Calc IN ('FHIA','HIA') THEN '29239'
+                WHEN A.Facility_Calc IN ('FNOS','NOS') THEN '29251'
+                WHEN A.Facility_Calc IN ('FPGM','PGM') THEN '29254'
+                WHEN A.Facility_Calc = 'MVM' THEN '7984'
+                WHEN A.Facility_Calc = 'TSL' THEN '4883'
+                WHEN A.Facility_Calc = 'MVF' THEN '27817'
+                WHEN A.Facility_Calc = 'DHM' THEN '4885'
+                WHEN A.Facility_Calc = 'DHM-W' THEN '38290'
+                WHEN A.Facility_Calc = 'JVM' THEN '4887'
+                WHEN A.Facility_Calc = 'JVW' THEN '30658'
+                WHEN A.Facility_Calc = 'MPM' THEN '30659'
+                WHEN A.Facility_Calc = 'SLR' THEN '4886'
+                WHEN A.Facility_Calc = 'GRM' THEN '476'
+                WHEN A.Facility_Calc = 'ORM' THEN '4878'
+                WHEN A.Facility_Calc = 'SET' THEN '4879'
+                WHEN A.Facility_Calc = 'SEV' THEN '30661'
+                WHEN A.Facility_Calc = 'SGH' THEN '4880'
+                WHEN A.Facility_Calc = 'SJM' THEN '1721'
+                WHEN A.Facility_Calc = 'SSM' THEN '7000135'
+                WHEN A.Facility_Calc = 'WRH' THEN '30662'
+                WHEN A.Facility_Calc = 'WRM' THEN '819'
+           END,
+           A.NameFirst,
+           LEFT(A.NameMiddle,1) AS MI,
+           A.NameLast,
+           REPLACE(ADDR.Address1,',', ' ') As Addr1,
+           REPLACE(ADDR.Address2,',', ' ') As Addr2,
+           ADDR.City,
+           ADDR.StateFree,
+           ADDR.Zip,
+           Phone.Home As HomePhone,
+           Phone.Cell As CellPhone,
+           Email = CASE
+                When ADDR.UseEmail = 'N' Then Null
+                Else ADDR.Email
+           END,
+           A.MRN,
+           A.AccountNumber,
+           PrefLang = CASE
+                WHEN HIMD.Language_MisLangID = 'ENG' THEN '00'
+                WHEN HIMD.Language_MisLangID IN ('CAN','MAN','WU','YUE','CHI','CHO') THEN '10'
+                WHEN HIMD.Language_MisLangID = 'FRE' THEN '20'
+                WHEN HIMD.Language_MisLangID = 'GER' THEN '04'
+                WHEN HIMD.Language_MisLangID = 'ITA' THEN '05'
+                WHEN HIMD.Language_MisLangID IN ('POR','BRP') THEN '08'
+                WHEN HIMD.Language_MisLangID = 'POL' THEN '06'
+                WHEN HIMD.Language_MisLangID = 'RUS' THEN '03'
+                WHEN HIMD.Language_MisLangID = 'SPA' THEN '01'
+                WHEN HIMD.Language_MisLangID = 'VIE' THEN '13'
+                WHEN HIMD.Language_MisLangID = 'CRE' THEN '36'
+                ELSE '00'
+           END,
+           A.Sex,
+           CONVERT(VARCHAR(10),A.Birthdate,101) As DOB,
+           CONVERT(VARCHAR(10),A.ServiceDt,101) As ServiceDate,
+           CONVERT(VARCHAR(10),A.DischDt,101) As DcDate,
+           ISNULL(A.Expired,'') As DeceasedFlag,
+           A.LocID [Location],
+           LOCSITE = CASE
+                WHEN CHARINDEX('Andover',MISLOC.Name,0) > 0 THEN 'ANDVR'
+                WHEN LEFT(MISLOC.Name,2) = 'HF' THEN 'HFH'
+                WHEN LEFT(MISLOC.Name,2) = 'HM' THEN 'HMV'
+                WHEN A.LocID = 'ED.SATCH' THEN 'QMC'
+                WHEN A.Facility_MisFacID = 'SET' THEN 'SET'
+                WHEN A.Facility_MisFacID = 'SEV' THEN 'SEV'
+                WHEN LEFT(A.LocID,4) = 'DHMW' THEN 'DHM-W'
+                WHEN LEFT(A.LocID,6) = 'RMWHCH' THEN 'Rocky Mtn Womens Health - HL'
+                WHEN LEFT(A.LocID,6) = 'RMWHCL' THEN 'Rocky Mtn Womens Health - Layton'
+                WHEN LEFT(A.LocID,6) = 'RMWHCS' THEN 'Rocky Mtn Womens Health - SL'
+                ELSE MISLOC.FacilityScalar_MisFacID
+           END,
+           CASE
+                WHEN A.RegConfidential = 'Y' or A.HimConfidential = 'Y' Then 'C'
+                ELSE HIMD.MarketingCommunications
+           END as [MKT_COM],
+           mrm.Name  [RaceName],
+           mlm.Name  [PreferredLanguage],
+           COALESCE(ge.ElementLongResponse,ge.ElementResponse) [EthnicityName],
+           HSO.SexualOrientation [SexualOrientation],
+           '' as Blank5,
+           '' as Blank6,
+           '$' AS EOR
+    FROM  Accounts as A
+    LEFT JOIN livefdb.dbo.MisLoc_Main MISLOC ON A.SourceID = MISLOC.SourceID AND A.LocID = MISLOC.MisLocID
+    LEFT JOIN livefdb.dbo.HimRec_Address ADDR ON ADDR.SourceID = A.SourceID AND ADDR.PatientID = A.PatientID
+    LEFT JOIN livefdb.dbo.MisFieldMap_Maps ADSRCMAP ON ADSRCMAP.SourceID = A.SourceID
+        AND ADSRCMAP.MisFieldMapID = 'ADM SRC'
+        AND ADSRCMAP.MapFromID = A.AdmSrc
+    LEFT JOIN livefdb.dbo.MisFieldMap_Maps DISPMAP ON DISPMAP.SourceID = A.SourceID
+        AND DISPMAP.MisFieldMapID = 'DISCH DISPOS'
+        AND A.DcDispo = DISPMAP.MapFromID
+    LEFT JOIN livefdb.dbo.HimRec_Data HIMD ON HIMD.SourceID = A.SourceID AND HIMD.PatientID = A.PatientID
+    LEFT JOIN livefdb.dbo.MisRace_Main mrm  on HIMD.SourceID = mrm.SourceID and HIMD.Race_MisRaceID = mrm.MisRaceID
+    LEFT JOIN livefdb.dbo.MisLang_Main mlm  on HIMD.SourceID = mlm.SourceID and HIMD.Language_MisLangID = mlm.MisLangID
+    LEFT JOIN livefdb.dbo.HimRec_CustomDataQueries_Queries hrq on HIMD.SourceID = hrq.SourceID
+        AND HIMD.PatientID = hrq.PatientID AND hrq.QueryID = 'ADMETHNIC'
+    LEFT JOIN livefdb.dbo.MisGroupResp_GroupElements ge on hrq.SourceID = ge.SourceID
+        AND hrq.QueryGroupResponse_MisGroupRespID = ge.MisGroupRespID
+        AND hrq.QueryResponse = ge.ElementMnemonicID
+    OUTER APPLY (
+        Select TOP 1 HOME As Home, CELL As Cell
+        FROM (
+            Select PatientID As Patient,
+                PhoneType_MisPhNumTypeID As PType,
+                PhoneNumberID As PNum
+            From livefdb.dbo.HimRec_PhoneNumbers as p
+            Where p.SourceID = A.SourceID AND p.PatientID = A.PatientID
+                AND LEN(PhoneNumberID)>12
+                AND p.PhoneType_MisPhNumTypeID IN ('HOME','CELL')
+        )  SrcTbl
+        Pivot ( max(PNum) FOR PType in (HOME,CELL) ) Phones
+    ) Phone
+    OUTER APPLY (
+        Select Top 1 HQ.RowUpdateDateTime, COALESCE(ge.ElementLongResponse,ge.ElementResponse)  [SexualOrientation]
+        From livefdb.dbo.HimRec_CustomDataQueries_Queries As HQ
+        LEFT JOIN  livefdb.dbo.MisGroupResp_GroupElements ge on HQ.SourceID = ge.SourceID
+            AND HQ.QueryGroupResponse_MisGroupRespID = ge.MisGroupRespID
+            AND HQ.QueryResponse = ge.ElementMnemonicID
+        Where 1=1
+            and A.SourceID = HQ.SourceID
+            and A.PatientID = HQ.PatientID
+            and HQ.QueryID IN ('ADM.SO','N.PEDSXORIEN','P.PFSH.SEXUALI') 
+        Order By HQ.RowUpdateDateTime Desc, HQ.QueryID Desc
+    ) HSO
+    WHERE 1=1
+        AND COALESCE(DISPMAP.MapTo,'') NOT IN ('07','09','21','87') 
+        AND A.MRN NOT IN ('HF00762143')
+        AND ADSRCMAP.MapTo <> '8'
+    ORDER BY DESIGNATOR
+
+    OPTION (RECOMPILE);
+
+END
+
+SET NOEXEC OFF
+
+
+
+
+
+-------------------------------------
+
+
+USE [Data_Services]
+GO
+/****** Object:  UserDefinedFunction [dbo].[udf_Split]    Script Date: 7/9/2025 10:57:12 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER FUNCTION [dbo].[udf_Split]
+(
+  @List      VARCHAR(8000), 
+  @Delimiter VARCHAR(5)
+) 
+RETURNS @TableOfValues TABLE 
+(
+  RowID   SMALLINT IDENTITY(1,1), 
+  [Value] VARCHAR(100) 
+) 
+AS 
+BEGIN
+  DECLARE @LenString INT 
+
+  WHILE LEN(@List) > 0 
+  BEGIN 
+    SELECT @LenString = 
+      (CASE CHARINDEX(@Delimiter, @List) 
+          WHEN 0 THEN LEN(@List) 
+          ELSE (CHARINDEX(@Delimiter, @List) -1 )
+       END
+      ) 
+
+    INSERT INTO @TableOfValues 
+      SELECT SUBSTRING(@List, 1, @LenString)
+
+    SELECT @List = 
+      (CASE (LEN(@List) - @LenString) 
+          WHEN 0 THEN '' 
+          ELSE RIGHT(@List, LEN(@List) - @LenString - 1) 
+       END
+      ) 
+  END
+
+  RETURN 
+END 
